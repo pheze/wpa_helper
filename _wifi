@@ -1,0 +1,143 @@
+#!/usr/bin/python2.7
+from pprint import pprint
+from os import popen
+import string
+import re
+import time
+
+def die(what):
+    print 'err: %s' % what
+    exit(1)
+
+def cmd(what):
+    return popen('sudo %s' % what).readlines()
+
+def find_interface():
+    for line in cmd('iwconfig 2>/dev/null'):
+        if 'IEEE' in line:
+            return line.split()[0]
+
+    return None
+
+def find_info(interface):
+    saved = {}
+    current = None
+
+    for line in cmd('iwlist %s scanning' % interface):
+        if "ESSID:\"" in line:
+            current = line.split('"')[1]
+            saved[current]=[]
+        
+        if current: 
+            saved[current].append(line.strip())
+
+    infos = {}
+    for ssid in saved:
+        infos[ssid]={}
+        for line in saved[ssid]:
+            if ':' not in line: 
+                continue
+            
+            info = map(string.strip, line.split(':'))
+
+            key = info[0]
+            value = ''.join(info[1:])
+
+            to_save = { 'IE':'IE', 'Pairwise Ciphers':'cipher' }
+            
+            for reg in to_save:
+                if re.match(reg, key):
+                    if reg == 'IE':
+                        if 'wpa' in infos[ssid]:
+                            break
+                        
+                        if 'WPA2' in value:
+                            infos[ssid]['wpa'] = 'wpa2'
+                        else:
+                            infos[ssid]['wpa'] = 'wpa'
+
+                        continue
+
+                    infos[ssid][to_save[reg]] = value
+
+    return infos
+
+def print_infos(infos):
+    pprint(infos)
+
+def create_supplicant(info):
+    ssid = '"%s"' % info['ssid']
+    psk = '"%s"' % info['psk']
+
+    if info.get('wpa') == 'wpa':
+        proto='WPA'
+    elif info.get('wpa') == 'wpa2':
+        proto='RSN'
+    else:
+        proto='Dunno maybe wep? todo'
+
+    text = """
+ctrl_interface=/var/run/wpa_supplicant
+update_config=1
+
+network={
+	ssid=%s
+	psk=%s
+	proto=%s
+	key_mgmt=WPA-PSK
+	auth_alg=OPEN
+}""" % (ssid, psk, proto)
+
+    return text
+
+import sys
+
+if sys.argv[1:] and not sys.argv[2:]: 
+    die('syntax: <SSID> <pass> [start]')
+
+interface = find_interface() or die("no interface")
+
+print 'Interface: %s' % interface
+cmd('ifconfig %s down' % interface)
+cmd('ifconfig %s up' % interface)
+
+infos = find_info(interface)
+
+if not infos:
+    die('Can\'t find any wireless info')
+
+
+if not sys.argv[1:]: 
+    print_infos(infos)
+    exit()
+
+
+ssid, psk = sys.argv[1:3]
+
+info = infos[ssid]
+info['ssid'] = ssid
+info['psk'] = psk
+
+supplicant = create_supplicant(info)
+
+if not sys.argv[3:]:
+    print supplicant
+    exit()
+
+cmd('pkill dhcpcd')
+cmd('pkill wpa_supplicant')
+
+pprint(info)
+
+with open('.wifi_temp', 'w') as f:
+    f.write(supplicant)
+
+cmd('cp .wifi_temp /etc/wpa_supplicant.conf')
+
+cmd('wpa_supplicant -Dwext -i%s -c/etc/wpa_supplicant.conf -B' % interface)
+
+time.sleep(5)
+
+cmd('dhcpcd %s' % interface)
+print ''.join(cmd('ping -c 1 google.com'))
+
